@@ -1,16 +1,18 @@
 import torch
 import torch.nn as nn
 from einops import *
+import numpy as np
 import torchvision
 from transformers import PretrainedConfig, PreTrainedModel, TrainingArguments, Trainer
 from datasets import load_dataset
 from torch import Tensor
 from jaxtyping import Int, Float
 from typing import Callable
+from copy import deepcopy
 
 
 
-class Config(PretrainedConfig):
+class MLPConfig(PretrainedConfig):
     def __init__(
         self,
         d_input: int = 784,
@@ -28,7 +30,9 @@ class Config(PretrainedConfig):
         lr: float = 0.001,
         weight_decay: float = 0,
         latent_noise: float | None = 0.33,
+        input_noise: float | None = 0.33,
         batch_size: int = 100,
+        validation_batch_size: int = 100,
         epochs: int = 10,
         optimizer: str = 'adamw',
         scheduler_lambda:  Callable[[int], float]| None = None,
@@ -51,7 +55,9 @@ class Config(PretrainedConfig):
         self.lr = lr
         self.weight_decay = weight_decay
         self.latent_noise = latent_noise
+        self.input_noise = input_noise
         self.batch_size = batch_size
+        self.validation_batch_size = validation_batch_size
         self.epochs = epochs
         self.optimizer = optimizer
         self.scheduler_lambda = scheduler_lambda
@@ -59,8 +65,98 @@ class Config(PretrainedConfig):
         super().__init__(**kwargs)
 
 
+class BaseModel(PreTrainedModel):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+
+    def forward(self, x):
+        pass
+
+    def compute_metrics(self, outputs, labels):
+        metrics = {}
+        metrics['loss'] = nn.CrossEntropyLoss()(outputs, labels)
+        return metrics
+    
+    def transform_inputs(self, inputs, labels):
+        if self.config.dataset == 'mnist':
+            inputs = inputs.reshape(inputs.shape[0], -1).to(self.device)
+            labels = labels.to(self.device)
+        return inputs, labels
+    
+    def set_dataset(self):
+        if self.config.dataset == 'mnist':
+            self.train_dataset = torchvision.datasets.MNIST(root='./data',
+                                           train=True,
+                                           transform=torchvision.transforms.ToTensor(),
+                                           download=True)
+            self.test_dataset = torchvision.datasets.MNIST(root='./data',
+                                            train=False,
+                                            transform=torchvision.transforms.ToTensor())
+            self.train_loader = torch.utils.data.DataLoader(dataset=self.train_dataset,
+                                                        batch_size=self.config.batch_size,
+                                                        shuffle=True)
+            self.test_loader = torch.utils.data.DataLoader(dataset=self.test_dataset,
+                                                    batch_size=self.config.validation_batch_size,
+                                                    shuffle=False)
+            
+    def fit(self):
+        self.set_dataset()
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self.config.scheduler_lambda)
+
+        epochs = self.config.epochs
+        n_total_steps = len(self.train_loader)
+        for epoch in range(epochs):
+            _ = self.validation()
+            for i, (inputs, labels) in enumerate(self.train_loader):
+                self.train()
+                inputs, labels = self.transform_inputs(inputs, labels)
+                
+                # Forward pass
+                outputs = self.forward(inputs)
+                metrics = self.compute_metrics(outputs, labels)
+
+                # Backward and optimize
+                optimizer.zero_grad()
+                metrics['loss'].backward()
+                optimizer.step()
+
+                if (i+1) % 100 == 0:
+                    metrics_str = [f'{k}: {v.item():.4f}' for k, v in metrics.items()]
+                    print (f'Epoch [{epoch+1}/{epochs}], Step [{i+1}/{n_total_steps}], ' + ', '.join(metrics_str))
+
+            scheduler.step()
+            print(f'learning rate = {scheduler.get_last_lr()[0]}')
+        _ = self.validation()
+
+    def validation(self, print_bool=True):
+        # if not hasattr(self, 'test_loader'):
+        self.set_dataset()
+
+        self.eval()
+        with torch.no_grad():
+            n_correct = 0
+            n_samples = 0
+            loss_sum = 0
+            count = 0
+            for inputs, labels in self.test_loader:
+                inputs, labels = self.transform_inputs(inputs, labels)
+                outputs = self.forward(inputs).to(self.device)
+                _, predicted = torch.max(outputs.data, 1)
+                n_samples += labels.size(0)
+                n_correct += (predicted == labels).sum().item()
+                loss_sum += self.compute_metrics(outputs, labels)['loss'].item()
+                count += 1
+
+            acc = 100.0 * n_correct / n_samples
+            loss = loss_sum / count
+            if print_bool:
+              print(f'Evaluation | Accuracy: {acc:.2f} %, Loss: {loss:.4f}')
+        return acc, loss
+
+
 class GatedMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: MLPConfig) -> None:
         super().__init__()
         
         self.W = nn.Linear(config.d_model, 2 * config.d_hidden, bias=config.mlp_bias)
@@ -70,7 +166,8 @@ class GatedMLP(nn.Module):
             self.activation = lambda x: x
         
         if config.d_hidden == config.d_model:
-            self.Proj.weight = nn.Parameter(torch.eye(config.d_model), requires_grad=False)
+            # self.Proj.weight = nn.Parameter(torch.eye(config.d_model), requires_grad=False)
+            self.Proj = nn.Identity()
     
     def forward(self, x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
         left, right = self.W(x).chunk(2, dim=-1)
@@ -78,7 +175,7 @@ class GatedMLP(nn.Module):
     
 
 class MLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: MLPConfig) -> None:
         super().__init__()
         
         self.W = nn.Linear(config.d_model, config.d_hidden, bias = config.mlp_bias)
@@ -92,7 +189,7 @@ class MLP(nn.Module):
     
 
 class LatentNoise(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config: MLPConfig) -> None:
         super().__init__()
         self.scale = config.latent_noise
     
@@ -105,7 +202,7 @@ class LatentNoise(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: MLPConfig):
         super().__init__()
         self.eps = 1e-8
     
@@ -114,7 +211,7 @@ class RMSNorm(nn.Module):
 
 
 class Norm(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: MLPConfig):
         super().__init__()
         
         self.norm = {
@@ -129,7 +226,7 @@ class Norm(nn.Module):
     
 
 class Layer(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: MLPConfig):
         super().__init__()
         
         mlp_fn = dict(bilinear=GatedMLP, 
@@ -145,103 +242,237 @@ class Layer(nn.Module):
         x = self.mlp(x)
         return x
     
-class MLPModel(PreTrainedModel):
-    def __init__(self, config: Config) -> None:
+
+class MLPModel(BaseModel):
+    def __init__(self, config: MLPConfig) -> None:
         super().__init__(config)
         self.config = config
         if config.random_seed is not None:
             torch.manual_seed(config.random_seed)
 
-        # self.Noise = LatentNoise(config)
+        self.Noise = LatentNoise(config)
         self.Embed = nn.Linear(config.d_input, config.d_model, bias = False)
         self.layers = nn.ModuleList([Layer(config) for _ in range(config.n_layer)])
         self.Unembed = nn.Linear(config.d_model, config.d_output, bias = config.logit_bias)
         
     def forward(self, x):
-        # x = self.Noise(x)
+        x = self.Noise(x)
         x = self.Embed(x)
         for layer in self.layers:
             x = layer(x)
         return self.Unembed(x)
     
-    def criterion(self, outputs, labels):
-        return nn.CrossEntropyLoss()(outputs, labels)
+    def transform_inputs(self, inputs, labels):
+        inputs = inputs.reshape(inputs.shape[0], -1).to(self.device)
+        labels = labels.to(self.device)
+        if self.training and (self.config.input_noise is not None):
+            inputs += self.config.input_noise * torch.randn_like(inputs)
+        return inputs, labels
     
-    def dataset(self, loader = True):
-        if self.config.dataset == 'mnist':
-            train = torchvision.datasets.MNIST(root='./data',
-                                           train=True,
-                                           transform=torchvision.transforms.ToTensor(),
-                                           download=True)
-            test = torchvision.datasets.MNIST(root='./data',
-                                            train=False,
-                                            transform=torchvision.transforms.ToTensor())
-            if loader:
-                train_loader = torch.utils.data.DataLoader(dataset=train,
-                                                        batch_size=self.config.batch_size,
-                                                        shuffle=True)
-                test_loader = torch.utils.data.DataLoader(dataset=test,
-                                                    batch_size=self.config.batch_size,
-                                                    shuffle=False)
-                return train_loader, test_loader
-            else:
-                return train, test
-    
-    def fit(self):
-        train, test = self.dataset()
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self.config.scheduler_lambda)
-
-        epochs = self.config.epochs
-        n_total_steps = len(train)
-        for epoch in range(epochs):
-            _ = self.validation(test)
-            for i, (inputs, labels) in enumerate(train):
-                self.train()
-                inputs = inputs.reshape(inputs.shape[0], -1).to(self.device)
-                labels = labels.to(self.device)
-
-                if self.input_noise is not None:
-                    inputs += self.config.input_noise * torch.randn_like(inputs)
-                
-                # Forward pass
-                outputs = self.forward(inputs)
-                loss = self.criterion(outputs, labels)
-
-                # Backward and optimize
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                if (i+1) % 100 == 0:
-                    print (f'Epoch [{epoch+1}/{epochs}], Step [{i+1}/{n_total_steps}], Loss: {loss.item():.4f}')
-
-            scheduler.step()
-            print(f'learning rate = {scheduler.get_last_lr()[0]}')
-        _ = self.validation(test)
-
-    def validation(self, test_loader, print_bool=True):
-        self.eval()
+    def get_B(self, layer, out_vecs = None, device = 'cpu'):
         with torch.no_grad():
-            n_correct = 0
-            n_samples = 0
-            loss_sum = 0
-            count = 0
-            for inputs, labels in test_loader:
-                inputs = inputs.reshape(inputs.shape[0], -1).to(self.device)
-                labels = labels.to(self.device)
-                outputs = self.forward(inputs)
-                _, predicted = torch.max(outputs.data, 1)
-                n_samples += labels.size(0)
-                n_correct += (predicted == labels).sum().item()
-                loss_sum += self.criterion(outputs, labels).item()
-                count += 1
+            W1, W2 = self.layers[layer].mlp.W.weight.to(device).chunk(2, dim=0)
+            tensors = [W1, W2]
+            equation = 'h in1, h in2'
+            out_var = 'h'
+            if not isinstance(self.layers[layer].mlp.Proj, nn.Identity):
+                # add term to einsum
+                P = self.layers[layer].mlp.Proj.weight.to(device)
+                tensors.append(P)
+                equation += f', outp {out_var}'
+                out_var = 'outp'
 
-            acc = 100.0 * n_correct / n_samples
-            loss = loss_sum / count
-            if print_bool:
-              print(f'Evaluation | Accuracy: {acc:.2f} %, Loss: {loss:.4f}')
-        return acc, loss
+            if out_vecs is not None:
+                # add term to einsum
+                tensors.append(out_vecs.to(device))
+                equation += f', outv {out_var}'
+                out_var = 'outv'
+            
+            equation += f' -> {out_var} in1 in2'
+            tensors.append(equation)
+            B = einsum(*tensors)
+            B = 0.5 * (B + B.transpose(-1, -2))
+        return B
+    
+
+class EigLayer(nn.Module):
+    def __init__(self, eigvals, eigvecs = None):
+        super().__init__()
+        self.eigvals = nn.Parameter(eigvals, requires_grad=False) #[... eig]
+
+        if eigvecs is not None:
+            self.eigvecs = nn.Parameter(eigvecs, requires_grad=False) #[... eig d_model]
+        else:
+            self.eigvecs = None
+
+    def forward(self, x):
+        dims = ['']
+        if self.eigvecs is not None:
+            x = einsum(self.eigvecs, x, '... eig d_model, batch d_model -> batch ... eig')
+        x = x ** 2
+        x = einsum(self.eigvals, x, '... eig, batch ... eig -> batch ...')
+        return x
+
+class EigModel(BaseModel):
+    def __init__(self, model: MLPModel):
+        assert model.config.mlp == 'bilinear', "EigModel only works with bilinear MLPs"
+        super().__init__(model.config)
+        self.model = model
+        self.config = self.model.config
+        self.config.beta_temp = 1.0
+        
+        self.Embed = deepcopy(self.model.Embed)
+        self.Embed.weight.requires_grad = False
+        self.Embed.device = self.device
+
+        eigenvalues, eigenvectors = self.get_eigenvectors()
+        self.layers = nn.ModuleList(self.define_layers(eigenvalues, eigenvectors))
+
+        self.eff_eigvals = self.get_effective_eigenvalues()
+        self.to('cpu')
+
+    def forward(self, x):
+        x = self.Embed(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+    
+    def compute_metrics(self, outputs, labels):
+        metrics = {}
+        metrics['loss'] = nn.CrossEntropyLoss()(self.config.beta_temp * outputs, labels)
+        return metrics
+
+    def get_eigenvectors(self):
+        with torch.no_grad():
+            eigenvalues = []
+            out_vectors = self.model.Unembed.weight.cpu()
+            for layer in range(self.config.n_layer-1, -1, -1):
+                B = self.model.get_B(layer, device='cpu')
+                interaction_matrices = einsum(B, out_vectors, 'out in1 in2, ... out -> ... in1 in2')
+                eigvals, eigvecs = torch.linalg.eigh(interaction_matrices)
+                eigvecs = eigvecs.transpose(-1, -2) # convert to [... eig d_model]
+
+                if self.config.normalization is not None:
+                    eigvals = eigvals / eigvals.abs().max()
+
+                eigenvalues.append(eigvals)
+                out_vectors = eigvecs
+            return eigenvalues, eigvecs
+
+    def define_layers(self, eigenvalues, eigvecs):
+        layers = []
+        for layer_idx in range(self.config.n_layer):
+            idx = self.config.n_layer - 1 - layer_idx
+            eigvals = eigenvalues[idx]
+            if layer_idx == 0:
+                layer = EigLayer(eigvals, eigvecs = eigvecs)
+            else:
+                layer = EigLayer(eigvals)
+            layers.append(layer)
+        return layers
+            
+    def get_effective_eigenvalues(self):
+        with torch.no_grad():
+            eigvals = self.layers[0].eigvals.abs()
+            for idx, layer in enumerate(self.layers[1:]):
+                layer_idx = idx + 1
+                shape = list(layer.eigvals.shape) + [1] * layer_idx
+                power = (0.5)**(layer_idx)
+                magnitude = layer.eigvals.reshape(*shape).abs()**(power)
+                eigvals *= magnitude
+        return eigvals
+            
+
+
+
+            
+
+
+# class EigModel(BaseModel):
+#     def __init__(self, model: MLPModel):
+#         assert model.config.mlp == 'bilinear', "EigModel only works with bilinear MLPs"
+#         super().__init__(model.config)
+#         self.model = model
+#         self.config = self.model.config
+        
+
+#     def forward(self, x):
+#         with torch.no_grad():
+#             x = x.to(self.model.device)
+#             x = self.model.Embed(x).cpu()
+#             return torch.stack([node.forward(x) for node in self.root_nodes], dim=-1)
+    
+#     def transform_inputs(self, inputs, labels):
+#         inputs = inputs.reshape(inputs.shape[0], -1).to(self.device)
+#         labels = labels.to(self.device)
+#         return inputs, labels
+
+#     def set_eigenvector_model(self, threshold = 1e-2):
+#         with torch.no_grad():
+#             self.root_nodes = self.get_root_nodes()
+
+#             nodes = self.root_nodes
+#             for layer in range(self.config.n_layer-1, -1, -1):
+#                 print(f"Layer {layer},   Nodes: {len(nodes)}")
+#                 B = self.model.get_B(layer)
+
+#                 max_log_eigval = -np.inf
+#                 for node in nodes:
+#                     child_log_eigvals = node.get_child_eigenvalues(B)
+#                     max_log_eigval = max([max_log_eigval] + child_log_eigvals.tolist())
+                
+#                 leaf_nodes = []
+#                 log_thresh = max_log_eigval + np.log(threshold)
+#                 for node in nodes:
+#                     leaf_nodes.extend(node.add_child_nodes(log_thresh))
+                
+#                 nodes = leaf_nodes
+#             self.leaf_nodes = nodes
+
+#     def get_root_nodes(self):
+#         nodes = []
+#         for i in range(self.model.config.d_output):
+#             out_vec = self.model.Unembed.weight[i].cpu()
+#             nodes.append(EigenNode(None, out_vec, 0))
+#         return nodes
+        
+        
+# class EigenNode():
+#     def __init__(self, parent, eigenvector, log_eigval):
+#         self.parent = parent
+#         self.eigenvector = eigenvector
+#         self.log_eigval = log_eigval
+
+#         self.child_nodes = None
+#         self.children_signs = None
+#         self.children_log_eigvals = None
+#         self.child_eigvecs = None
+
+#     def forward(self, x):
+#         # x: [batch, d_model]
+#         if self.child_nodes is not None:
+#             out = torch.stack([child.forward(x) * sign for child, sign in zip(self.child_nodes, self.child_signs)], dim=-1)
+#             return (out.sum(dim=-1))**2
+#         else:
+#             return (x @ self.eigenvector)**2 * torch.exp(self.log_eigval)
+
+#     def get_child_eigenvalues(self, B):
+#         interaction_matrix = einsum(B, self.eigenvector, 'out in1 in2, out -> in1 in2')
+#         eigvals, eigvecs = torch.linalg.eigh(interaction_matrix)
+#         self.child_log_eigvals = torch.log(eigvals.abs()) + 0.5 * self.log_eigval
+#         self.child_signs = torch.sign(eigvals)
+#         self.child_eigvecs = eigvecs
+#         return self.child_log_eigvals
+    
+#     def add_child_nodes(self, log_thresh):
+#         keep = self.child_log_eigvals >= log_thresh
+#         self.child_log_eigvals = self.child_log_eigvals[keep]
+#         self.child_signs = self.child_signs[keep]
+#         self.child_eigvecs = self.child_eigvecs[:, keep]
+#         self.child_nodes = [EigenNode(self, self.child_eigvecs[:,i], self.child_log_eigvals[i]) for i in range(len(self.child_log_eigvals))]
+#         return self.child_nodes
+
+
 
 
 

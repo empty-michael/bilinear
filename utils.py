@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-def define_scheduler_lambda(warmup, constant, cooldown, min_lambda = 1e-2, steps_per = 1, start_lambda = None):
+def define_scheduler_lambda(epochs_list, min_lambda = 1e-2, steps_per = 1, start_lambda = None):
+    warmup, constant, cooldown = epochs_list
     assert (warmup % steps_per == 0) and (constant % steps_per == 0) and (cooldown % steps_per == 0), "steps_per must divide warmup, constant, and cooldown"
     if start_lambda is None:
         start_lambda = min_lambda

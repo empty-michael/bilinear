@@ -7,8 +7,9 @@ from transformers import PretrainedConfig, PreTrainedModel, TrainingArguments, T
 from datasets import load_dataset
 from torch import Tensor
 from jaxtyping import Int, Float
-from typing import Callable
+from typing import Callable, List
 from copy import deepcopy
+from utils import define_scheduler_lambda
 
 
 
@@ -35,8 +36,10 @@ class MLPConfig(PretrainedConfig):
         validation_batch_size: int = 100,
         epochs: int = 10,
         optimizer: str = 'adamw',
-        scheduler_lambda:  Callable[[int], float]| None = None,
-
+        scheduler_epochs: List[int] = [2, 2, 6],
+        scheduler_steps_per: int = 1,
+        scheduler_min_lambda: float | None = 0.03,
+        scheduler_start_lambda: float | None = None,
         **kwargs
     ):
         self.d_input = d_input
@@ -60,10 +63,12 @@ class MLPConfig(PretrainedConfig):
         self.validation_batch_size = validation_batch_size
         self.epochs = epochs
         self.optimizer = optimizer
-        self.scheduler_lambda = scheduler_lambda
+        self.scheduler_epochs = scheduler_epochs
+        self.scheduler_steps_per = scheduler_steps_per
+        self.scheduler_min_lambda = scheduler_min_lambda
+        self.scheduler_start_lambda = scheduler_start_lambda
         
         super().__init__(**kwargs)
-
 
 class BaseModel(PreTrainedModel):
     def __init__(self, config) -> None:
@@ -98,11 +103,15 @@ class BaseModel(PreTrainedModel):
             self.test_loader = torch.utils.data.DataLoader(dataset=self.test_dataset,
                                                     batch_size=self.config.validation_batch_size,
                                                     shuffle=False)
-            
+                
     def fit(self):
         self.set_dataset()
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, self.config.scheduler_lambda)
+        scheduler_lambda = define_scheduler_lambda(self.config.scheduler_epochs, 
+                                                   min_lambda = self.config.scheduler_min_lambda, 
+                                                   steps_per = self.config.scheduler_steps_per, 
+                                                   start_lambda = self.config.scheduler_start_lambda)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler_lambda)
 
         epochs = self.config.epochs
         n_total_steps = len(self.train_loader)
@@ -153,6 +162,10 @@ class BaseModel(PreTrainedModel):
             if print_bool:
               print(f'Evaluation | Accuracy: {acc:.2f} %, Loss: {loss:.4f}')
         return acc, loss
+    
+    def save_model_locally(self, filepath):
+        with open(filepath, 'wb') as f:
+            torch.save(self.state_dict(), f)
 
 
 class GatedMLP(nn.Module):
@@ -380,6 +393,8 @@ class EigModel(BaseModel):
                 power = (0.5)**(layer_idx)
                 magnitude = layer.eigvals.reshape(*shape).abs()**(power)
                 eigvals *= magnitude
+            sign = layer.eigvals.reshape(*shape).sign()
+            eigvals *= sign # only the sign of the last layer matters
         return eigvals
             
 

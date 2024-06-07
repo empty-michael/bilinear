@@ -8,3 +8,7 @@ data/MNIST/raw/train-labels-idx1-ubyte
 data/MNIST/raw/train-labels-idx1-ubyte.gz
 __pycache__/model.cpython-312.pyc
 __pycache__/utils.cpython-312.pyc
+saved_models/mnist_l2_d300/config.json
+saved_models/mnist_l2_d300/model.safetensors
+saved_models/mnist_l2_d300_input_noise/config.json
+saved_models/mnist_l2_d300_input_noise/model.safetensors

@@ -3,12 +3,12 @@ import torch.nn as nn
 from einops import *
 import numpy as np
 import torchvision
-from transformers import PretrainedConfig, PreTrainedModel, TrainingArguments, Trainer
-from datasets import load_dataset
+from transformers import PretrainedConfig, PreTrainedModel
 from torch import Tensor
 from jaxtyping import Int, Float
-from typing import Callable, List
+from typing import List
 from copy import deepcopy
+from collections import defaultdict
 from utils import define_scheduler_lambda
 
 
@@ -79,8 +79,13 @@ class BaseModel(PreTrainedModel):
 
     def compute_metrics(self, outputs, labels):
         metrics = {}
+        metrics['CE_loss'] = nn.CrossEntropyLoss()(outputs, labels)
         metrics['loss'] = nn.CrossEntropyLoss()(outputs, labels)
         return metrics
+    
+    def get_predictions(self, outputs):
+        _, predicted = torch.max(outputs.data, 1)
+        return predicted
     
     def transform_inputs(self, inputs, labels):
         if self.config.dataset == 'mnist':
@@ -150,11 +155,11 @@ class BaseModel(PreTrainedModel):
             count = 0
             for inputs, labels in self.test_loader:
                 inputs, labels = self.transform_inputs(inputs, labels)
-                outputs = self.forward(inputs).to(self.device)
-                _, predicted = torch.max(outputs.data, 1)
+                outputs = self.forward(inputs)
+                predicted = self.get_predictions(outputs)
                 n_samples += labels.size(0)
                 n_correct += (predicted == labels).sum().item()
-                loss_sum += self.compute_metrics(outputs, labels)['loss'].item()
+                loss_sum += self.compute_metrics(outputs, labels)['CE_loss'].item()
                 count += 1
 
             acc = 100.0 * n_correct / n_samples
@@ -162,10 +167,6 @@ class BaseModel(PreTrainedModel):
             if print_bool:
               print(f'Evaluation | Accuracy: {acc:.2f} %, Loss: {loss:.4f}')
         return acc, loss
-    
-    def save_model_locally(self, filepath):
-        with open(filepath, 'wb') as f:
-            torch.save(self.state_dict(), f)
 
 
 class GatedMLP(nn.Module):
@@ -176,10 +177,9 @@ class GatedMLP(nn.Module):
         self.Proj = nn.Linear(config.d_hidden, config.d_model, bias=False)
 
         if config.mlp == 'bilinear':
-            self.activation = lambda x: x
+            self.activation = nn.Identity()
         
         if config.d_hidden == config.d_model:
-            # self.Proj.weight = nn.Parameter(torch.eye(config.d_model), requires_grad=False)
             self.Proj = nn.Identity()
     
     def forward(self, x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
@@ -257,9 +257,12 @@ class Layer(nn.Module):
     
 
 class MLPModel(BaseModel):
+    config_class = MLPConfig
+
     def __init__(self, config: MLPConfig) -> None:
         super().__init__(config)
         self.config = config
+
         if config.random_seed is not None:
             torch.manual_seed(config.random_seed)
 
@@ -309,8 +312,9 @@ class MLPModel(BaseModel):
     
 
 class EigLayer(nn.Module):
-    def __init__(self, eigvals, eigvecs = None):
+    def __init__(self, eigvals, config, eigvecs = None):
         super().__init__()
+        self.config = config
         self.eigvals = nn.Parameter(eigvals, requires_grad=False) #[... eig]
 
         if eigvecs is not None:
@@ -319,48 +323,82 @@ class EigLayer(nn.Module):
             self.eigvecs = None
 
     def forward(self, x):
-        dims = ['']
         if self.eigvecs is not None:
             x = einsum(self.eigvecs, x, '... eig d_model, batch d_model -> batch ... eig')
+        else:
+            x = x.sum(dim=-1) # sum over previous layer's activations
         x = x ** 2
-        x = einsum(self.eigvals, x, '... eig, batch ... eig -> batch ...')
+        # x = einsum(self.eigvals, x, '... eig, batch ... eig -> batch ...')
+        x = self.eigvals.unsqueeze(0) * x
+        
+        if self.config.topk is not None:
+            x = self.apply_topk(x, self.config.topk)
         return x
+
+    def apply_topk(self, x, topk):
+        shape = x.shape
+        if self.config.topk_by_class:
+            x = x.reshape(shape[0], shape[1], -1) # [batch, class, eig]
+        else:
+            x = x.reshape(shape[0], -1)
+        topk = min(topk, x.shape[-1])
+        _, indices = torch.topk(x.abs(), topk, dim=-1, sorted=False)
+        values = x.gather(-1, indices)
+        y = torch.zeros_like(x)
+        y = y.scatter(-1, indices, values).reshape(shape)
+        return y
+        
+        
+# class EigLayer(nn.Module):
+#     def __init__(self, eigvals, final=False):
+#         super().__init__()
+#         self.final = final
+#         self.eigvals = nn.Parameter(eigvals, requires_grad=False) #[... eig]
+
+#     def forward(self, x):
+#         acts = einsum(self.eigvals, x, '... eig, batch ... eig -> batch ...')
+#         if self.final:
+#             x = acts
+#         else:
+#             x = acts ** 2
+#         return x, acts
 
 class EigModel(BaseModel):
     def __init__(self, model: MLPModel):
         assert model.config.mlp == 'bilinear', "EigModel only works with bilinear MLPs"
         super().__init__(model.config)
-        self.model = model
-        self.config = self.model.config
+        self.config = model.config
         self.config.beta_temp = 1.0
+        self.config.topk = None
+        self.config.topk_by_class = True
         
-        self.Embed = deepcopy(self.model.Embed)
-        self.Embed.weight.requires_grad = False
+        self.Embed = nn.Linear(self.config.d_input, self.config.d_model, bias = False)
+        self.Embed.weight = nn.Parameter(model.Embed.weight, requires_grad=False)
         self.Embed.device = self.device
 
-        eigenvalues, eigenvectors = self.get_eigenvectors()
+        eigenvalues, eigenvectors = self.get_eigenvectors(model)
         self.layers = nn.ModuleList(self.define_layers(eigenvalues, eigenvectors))
 
-        self.eff_eigvals = self.get_effective_eigenvalues()
         self.to('cpu')
 
     def forward(self, x):
         x = self.Embed(x)
         for layer in self.layers:
             x = layer(x)
-        return x
+        return x.sum(dim=-1) * self.config.beta_temp
     
     def compute_metrics(self, outputs, labels):
         metrics = {}
-        metrics['loss'] = nn.CrossEntropyLoss()(self.config.beta_temp * outputs, labels)
+        metrics['CE_loss'] = nn.CrossEntropyLoss()(outputs, labels)
+        metrics['loss'] = metrics['CE_loss']
         return metrics
 
-    def get_eigenvectors(self):
+    def get_eigenvectors(self, model):
         with torch.no_grad():
             eigenvalues = []
-            out_vectors = self.model.Unembed.weight.cpu()
+            out_vectors = model.Unembed.weight.cpu()
             for layer in range(self.config.n_layer-1, -1, -1):
-                B = self.model.get_B(layer, device='cpu')
+                B = model.get_B(layer, device='cpu')
                 interaction_matrices = einsum(B, out_vectors, 'out in1 in2, ... out -> ... in1 in2')
                 eigvals, eigvecs = torch.linalg.eigh(interaction_matrices)
                 eigvecs = eigvecs.transpose(-1, -2) # convert to [... eig d_model]
@@ -370,7 +408,7 @@ class EigModel(BaseModel):
 
                 eigenvalues.append(eigvals)
                 out_vectors = eigvecs
-            return eigenvalues, eigvecs
+        return eigenvalues, eigvecs
 
     def define_layers(self, eigenvalues, eigvecs):
         layers = []
@@ -378,28 +416,101 @@ class EigModel(BaseModel):
             idx = self.config.n_layer - 1 - layer_idx
             eigvals = eigenvalues[idx]
             if layer_idx == 0:
-                layer = EigLayer(eigvals, eigvecs = eigvecs)
+                layer = EigLayer(eigvals, self.config, eigvecs = eigvecs)
             else:
-                layer = EigLayer(eigvals)
+                layer = EigLayer(eigvals, self.config)
             layers.append(layer)
         return layers
+    
+    # def define_layers(self, eigenvalues, eigvecs):
+    #     layers = []
+    #     for idx, eigvals in enumerate(eigenvalues):
+    #         final = True if idx == 0 else False
+    #         layers.append(EigLayer(eigvals, final = final))
+    #     layers.append(EigLayer(eigvecs, final = False))
+    #     layers.reverse()
+    #     return layers
             
-    def get_effective_eigenvalues(self):
+    def get_effective_eigval_magnitude(self):
         with torch.no_grad():
-            eigvals = self.layers[0].eigvals.abs()
+            eigval_mag = self.layers[0].eigvals.abs()
             for idx, layer in enumerate(self.layers[1:]):
                 layer_idx = idx + 1
                 shape = list(layer.eigvals.shape) + [1] * layer_idx
                 power = (0.5)**(layer_idx)
                 magnitude = layer.eigvals.reshape(*shape).abs()**(power)
-                eigvals *= magnitude
-            sign = layer.eigvals.reshape(*shape).sign()
-            eigvals *= sign # only the sign of the last layer matters
-        return eigvals
-            
+                eigval_mag *= magnitude
+        return eigval_mag
 
 
+class EffectiveEigModel(EigModel):
 
+    def __init__(self, model: MLPModel):
+        super().__init__(model)
+        self.config.topk = None
+        self.config.topk_by_class = False
+        
+        eff_eigval_mags = self.get_effective_eigval_magnitude()
+        self.convert_to_effective_eigvals(eff_eigval_mags)
+        
+
+    def convert_to_effective_eigvals(self, eff_eigval_mags):
+        for idx, layer in enumerate(self.layers):
+            if idx == 0:
+                layer.eigvals = nn.Parameter(layer.eigvals.sign() * eff_eigval_mags, requires_grad=False)
+            else:
+                layer.eigvals = nn.Parameter(layer.eigvals.sign(), requires_grad=False)
+        
+
+
+class SparseEigModel(EigModel):
+    def __init__(self, model: MLPModel):
+        super().__init__(model)
+        self.config.L1_param = 1e-1        
+
+        self.left_biases = nn.ParameterList(
+            [nn.Parameter(torch.zeros(layer.eigvals.shape[:-1]), requires_grad=True) for layer in self.layers]
+            )
+        self.right_biases = nn.ParameterList(
+            [nn.Parameter(torch.zeros(layer.eigvals.shape[:-1]), requires_grad=True) for layer in self.layers]
+            )
+        # self.scales = nn.ParameterList(
+        #     [nn.Parameter(1e-3 * layer.eigvals.max() * torch.ones(layer.eigvals.shape[:-1]), requires_grad=True) for layer in self.layers]
+        #     )
+        
+        self.beta_temp = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+
+    def forward(self, x):
+        x = self.Embed(x)
+
+        aux_outputs = defaultdict(list)
+        for layer, left_bias, right_bias in zip(self.layers, self.left_biases, self.right_biases):
+            x, acts = layer(x)
+
+            acts_relu = (-1) * nn.functional.relu(-(acts + left_bias)) + nn.functional.relu((acts + right_bias))
+            x = x * (acts_relu.abs() > 0).float()
+            x = (acts_relu)**2
+
+            aux_outputs['L1'].append( acts_relu.abs().mean() )
+            aux_outputs['L0'].append( (acts_relu.abs() > 0).float().sum() / x.shape[0] )
+        return x * self.beta_temp, aux_outputs
+    
+    def compute_metrics(self, outputs, labels):
+        logits, aux_outputs = outputs
+
+        # change to not average over batch
+        metrics = {}
+        metrics['CE_loss'] = nn.CrossEntropyLoss()(logits, labels)
+        metrics['L1'] = torch.sum(torch.stack(aux_outputs['L1']))
+        metrics['L0'] = torch.sum(torch.stack(aux_outputs['L0']))
+        metrics['loss'] = metrics['CE_loss'] + self.config.L1_param * metrics['L1']
+        metrics['loss'] = metrics['CE_loss']
+        return metrics
+    
+    def get_predictions(self, outputs):
+        logits, _ = outputs
+        _, predicted = torch.max(logits, 1)
+        return predicted
             
 
 

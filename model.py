@@ -348,20 +348,6 @@ class EigLayer(nn.Module):
         y = y.scatter(-1, indices, values).reshape(shape)
         return y
         
-        
-# class EigLayer(nn.Module):
-#     def __init__(self, eigvals, final=False):
-#         super().__init__()
-#         self.final = final
-#         self.eigvals = nn.Parameter(eigvals, requires_grad=False) #[... eig]
-
-#     def forward(self, x):
-#         acts = einsum(self.eigvals, x, '... eig, batch ... eig -> batch ...')
-#         if self.final:
-#             x = acts
-#         else:
-#             x = acts ** 2
-#         return x, acts
 
 class EigModel(BaseModel):
     def __init__(self, model: MLPModel):
@@ -421,15 +407,6 @@ class EigModel(BaseModel):
                 layer = EigLayer(eigvals, self.config)
             layers.append(layer)
         return layers
-    
-    # def define_layers(self, eigenvalues, eigvecs):
-    #     layers = []
-    #     for idx, eigvals in enumerate(eigenvalues):
-    #         final = True if idx == 0 else False
-    #         layers.append(EigLayer(eigvals, final = final))
-    #     layers.append(EigLayer(eigvecs, final = False))
-    #     layers.reverse()
-    #     return layers
             
     def get_effective_eigval_magnitude(self):
         with torch.no_grad():
